@@ -1,0 +1,353 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © jeremie_marvillier
+//@version=6
+// @description Librairie ICT — détection, suivi et visualisation des Order Blocks premium (avec sweep de liquidité)
+library("ict_ob")
+import jeremie_marvillier/ict_utils/1 as icu
+
+// ============================================================================
+//  TYPE
+// ============================================================================
+
+// @type Représente un Order Block (OB) premium ICT
+// @field top           Borne haute de la zone OB (high de la bougie OB)
+// @field bottom        Borne basse de la zone OB (low de la bougie OB)
+// @field bodyTop       Haut du corps de la bougie OB (max open/close)
+// @field bodyBottom    Bas du corps de la bougie OB (min open/close)
+// @field middle        Milieu de la zone OB (high+low / 2)
+// @field amplitude     Hauteur de la zone en points (top - bottom)
+// @field amplitudePct  Hauteur de la zone en % du prix (référence : bottom)
+// @field isBull        Nature D'ORIGINE de l'OB (immuable) : true = haussier (support), false = baissier (résistance)
+// @field isInverted    true si l'OB a été cassé et a changé de polarité → Breaker Block
+// @field isClosed      true si la zone a été entièrement mitigée (comblée)
+// @field deepestRetest Prix du retest le plus profond dans le référentiel courant
+//                      (remis à na lors de l'inversion : le sens du retest change)
+// @field startTime     Timestamp de la bougie OB (dernière bougie opposée avant le sweep)
+// @field sweepTime     Timestamp de la bougie de sweep (prise de liquidité)
+// @field invertedTime  Timestamp de la bougie où l'inversion en Breaker Block a eu lieu
+// @field closedTime    Timestamp où l'OB a été entièrement mitigé
+// @field visual        Box de la zone complète (high–low) de l'OB
+// @field bodyBox       Box du corps (bodyTop–bodyBottom) de la bougie OB
+// @field middleLine    Ligne médiane de la zone
+// @field retestLine    Ligne du retest le plus profond
+export type OB
+    float top
+    float bottom
+    float bodyTop
+    float bodyBottom
+    float middle
+    float amplitude     = na
+    float amplitudePct  = na
+    bool  isBull
+    bool  isInverted    = false
+    bool  isClosed      = false
+    float deepestRetest = na
+    int   startTime     = na
+    int   sweepTime     = na
+    int   invertedTime  = na
+    int   closedTime    = na
+    box   visual        = na
+    box   bodyBox       = na
+    line  middleLine    = na
+    line  retestLine    = na
+
+// ============================================================================
+//  HELPERS
+// ============================================================================
+
+// @function Direction EFFECTIVE de l'OB : tient compte de l'inversion Breaker.
+//           Un OB baissier inversé agit comme une zone haussière, et vice-versa.
+// @param this L'objet OB
+// @returns true si l'OB agit actuellement comme une zone haussière
+export method effectiveBull(OB this) =>
+    this.isInverted ? not this.isBull : this.isBull
+
+// ============================================================================
+//  DÉTECTION
+// ============================================================================
+
+// @function Détecte un Order Block premium sur la bougie courante.
+//           Un OB premium requiert une prise de liquidité préalable (sweep) :
+//           — Bullish OB  : sweep d'un plus bas récent (SSL) →
+//                           dernière bougie baissière dans les swingLen bougies précédant le sweep
+//           — Bearish OB  : sweep d'un plus haut récent (BSL) →
+//                           dernière bougie haussière dans les swingLen bougies précédant le sweep
+//           La zone OB couvre le range complet (high–low) de cette bougie.
+//           Le corps (bodyTop–bodyBottom) est calculé séparément (open/close).
+//           Doit être appelée à chaque bougie (barre fermée).
+// @param candlesOpens   Série des ouvertures
+// @param candlesHighs   Série des plus hauts
+// @param candlesLows    Série des plus bas
+// @param candlesCloses  Série des clôtures
+// @param swingLen       Lookback pour la détection du swing à purger (défaut 10)
+// @returns OB ou na si aucun OB premium détecté sur cette bougie
+export GetPremiumOB(
+     series float candlesOpens,
+     series float candlesHighs,
+     series float candlesLows,
+     series float candlesCloses,
+     simple int   swingLen = 10) =>
+    OB result = na
+
+    // Niveaux de liquidité récents à purger (excluant la bougie courante)
+    float swingLow  = ta.lowest(candlesLows,  swingLen)[1]
+    float swingHigh = ta.highest(candlesHighs, swingLen)[1]
+
+    // Nouveau sweep uniquement si la barre précédente n'était pas déjà en transgression
+    // (évite les redétections sur une série de bougies consécutives sous/sur le niveau)
+    bool newBullSweep = candlesLows[0]  < swingLow  and candlesLows[1]  >= swingLow
+    bool newBearSweep = candlesHighs[0] > swingHigh and candlesHighs[1] <= swingHigh
+
+    // --- Bullish OB : dernière bougie baissière avant le sweep ---
+    if newBullSweep
+        for i = 1 to swingLen
+            if candlesCloses[i] < candlesOpens[i]
+                float t      = candlesHighs[i]
+                float b      = candlesLows[i]
+                float amp    = t - b
+                float ampPct = b != 0.0 ? amp / b * 100.0 : na
+                result := OB.new(
+                     top          = t,
+                     bottom       = b,
+                     bodyTop      = candlesOpens[i],
+                     bodyBottom   = candlesCloses[i],
+                     middle       = (t + b) / 2.0,
+                     amplitude    = amp,
+                     amplitudePct = ampPct,
+                     isBull       = true,
+                     startTime    = time[i],
+                     sweepTime    = time[0])
+                break
+
+    // --- Bearish OB : dernière bougie haussière avant le sweep ---
+    if na(result) and newBearSweep
+        for i = 1 to swingLen
+            if candlesCloses[i] > candlesOpens[i]
+                float t      = candlesHighs[i]
+                float b      = candlesLows[i]
+                float amp    = t - b
+                float ampPct = b != 0.0 ? amp / b * 100.0 : na
+                result := OB.new(
+                     top          = t,
+                     bottom       = b,
+                     bodyTop      = candlesCloses[i],
+                     bodyBottom   = candlesOpens[i],
+                     middle       = (t + b) / 2.0,
+                     amplitude    = amp,
+                     amplitudePct = ampPct,
+                     isBull       = false,
+                     startTime    = time[i],
+                     sweepTime    = time[0])
+                break
+
+    result
+
+// ============================================================================
+//  MISE À JOUR
+// ============================================================================
+
+// @function Met à jour l'état de l'OB : inversion (Breaker Block), mitigation et retest
+//           le plus profond. Cycle de vie : actif → inversé (Breaker) → mitigé.
+//           — Avant inversion : une clôture complète au-delà de la borne opposée
+//             au sens de l'OB provoque l'inversion (deepestRetest remis à na).
+//           — Après inversion : plus de ré-inversion possible, seule la
+//             mitigation dans le NOUVEAU sens effectif peut clôturer l'OB.
+//           — La phase de mitigation est bloquée sur la bougie même de l'inversion
+//             (justInverted) pour éviter une clôture immédiate : le prix vient de
+//             franchir la borne, il remplit forcément la condition de mitigation dans
+//             le nouveau sens si on l'évalue tout de suite.
+//           — La mitigation est évaluée par icu.checkMitigation() (mèche).
+// @param this         L'objet OB
+// @param currentHigh  Plus haut de la bougie courante
+// @param currentLow   Plus bas de la bougie courante
+// @param currentClose Clôture de la bougie courante
+export method update(OB this, float currentHigh, float currentLow, float currentClose) =>
+    if not this.isClosed
+        // --- Phase 1 : inversion → Breaker Block (uniquement si pas encore inversé) ---
+        bool justInverted = false
+        if not this.isInverted
+            if this.isBull and currentClose > this.top
+                // OB haussier cassé par clôture au-dessus → devient résistance (Bearish Breaker)
+                this.isInverted    := true
+                this.invertedTime  := time
+                this.deepestRetest := na
+                justInverted       := true
+            else if not this.isBull and currentClose < this.bottom
+                // OB baissier cassé par clôture en-dessous → devient support (Bullish Breaker)
+                this.isInverted    := true
+                this.invertedTime  := time
+                this.deepestRetest := na
+                justInverted       := true
+
+        // --- Phase 2 : retest + mitigation dans le référentiel EFFECTIF ---
+        // Bloquée sur la bougie d'inversion pour éviter une fermeture instantanée
+        if not justInverted
+            bool effBull = this.effectiveBull()
+            [mitigated, newDeepest] = icu.checkMitigation(
+                 effBull,
+                 this.top,
+                 this.bottom,
+                 currentHigh,
+                 currentLow,
+                 this.deepestRetest)
+            if mitigated
+                this.isClosed      := true
+                this.closedTime    := time
+            this.deepestRetest := newDeepest
+
+// ============================================================================
+//  NETTOYAGE
+// ============================================================================
+
+// @function Supprime tous les éléments graphiques d'un OB
+// @param this L'objet OB
+export method clear(OB this) =>
+    if not na(this.visual)
+        box.delete(this.visual)
+    if not na(this.bodyBox)
+        box.delete(this.bodyBox)
+    if not na(this.middleLine)
+        line.delete(this.middleLine)
+    if not na(this.retestLine)
+        line.delete(this.retestLine)
+
+// ============================================================================
+//  ORCHESTRATION
+// ============================================================================
+
+// @function Détecte, maintient (FIFO) et met à jour un tableau d'OB premium.
+//           Les OB existants sont mis à jour AVANT la détection du nouvel OB
+//           afin qu'un OB ne soit jamais mis à jour sur sa propre bougie de création.
+//           Déduplique automatiquement par startTime.
+//           L'état (tableau) doit être déclaré côté appelant avec `var`.
+// @param obs            Tableau d'OB à maintenir
+// @param candlesOpens   Série des ouvertures
+// @param candlesHighs   Série des plus hauts
+// @param candlesLows    Série des plus bas
+// @param candlesCloses  Série des clôtures
+// @param limit          Nombre max d'OB à conserver en mémoire — FIFO (défaut 20)
+// @param swingLen       Lookback pour la détection du swing à purger (défaut 10)
+// @returns Le nouvel OB créé sur cette bougie, ou na
+export process(
+     array<OB>    obs,
+     series float candlesOpens,
+     series float candlesHighs,
+     series float candlesLows,
+     series float candlesCloses,
+     simple int   limit    = 20,
+     simple int   swingLen = 10) =>
+    // 1. Mise à jour de tous les OB existants sur la bougie courante
+    for ob in obs
+        ob.update(candlesHighs[0], candlesLows[0], candlesCloses[0])
+
+    // 2. Détection d'un nouvel OB premium
+    OB newOb = GetPremiumOB(
+         candlesOpens,
+         candlesHighs,
+         candlesLows,
+         candlesCloses,
+         swingLen)
+
+    // 3. Ajout avec déduplication par startTime + éviction FIFO
+    if not na(newOb)
+        bool exists = false
+        for ob in obs
+            if ob.startTime == newOb.startTime
+                exists := true
+                break
+        if not exists
+            array.push(obs, newOb)
+            if array.size(obs) > limit
+                OB removed = array.shift(obs)
+                removed.clear()
+
+    newOb
+
+// ============================================================================
+//  RENDU
+// ============================================================================
+
+// @function Dessine ou met à jour la représentation graphique de l'OB.
+//           Deux couches de visualisation :
+//           — Zone complète (high–low) : couleur de base très transparente
+//           — Corps (bodyTop–bodyBottom) : même couleur, plus opaque, avec le label
+//           La couleur et le label suivent la direction EFFECTIVE :
+//           un Breaker Block ex-baissier s'affiche en bleu avec le préfixe "B".
+//           Les lignes médiane et de retest sont gérées via icu.updateMidLine()
+//           et icu.updateRetestLine().
+// @param this L'objet OB
+export method draw(OB this) =>
+    bool effBull = this.effectiveBull()
+
+    // Couleurs propres à l'OB (bleu/orange selon direction effective)
+    color baseColor  = effBull ? color.blue : color.orange
+    color bgColor    = color.new(baseColor, 88)
+    color bodyColor  = color.new(baseColor, 60)
+    color borderCol  = color.new(baseColor, 25)
+
+    // Couleurs partagées via ict_utils
+    color closedBg   = icu.closedBgColor()
+    color closedLine = icu.closedLineColor()
+
+    int rightTime = this.isClosed ? this.closedTime : time
+
+    // Label : "B" si Breaker, puis "OB+" ou "OB-" selon la direction effective
+    string prefix    = this.isInverted ? "B" : ""
+    string baseLabel = effBull ? "OB+" : "OB-"
+    string lbl       = prefix + baseLabel
+
+    // --- Zone complète (high–low) : fond très transparent ---
+    if na(this.visual)
+        this.visual := box.new(
+             left         = this.startTime,
+             top          = this.top,
+             right        = rightTime,
+             bottom       = this.bottom,
+             xloc         = xloc.bar_time,
+             border_color = color.new(baseColor, 80),
+             bgcolor      = bgColor)
+    box.set_right(this.visual, rightTime)
+    box.set_bgcolor(this.visual,      this.isClosed ? closedBg   : bgColor)
+    box.set_border_color(this.visual, this.isClosed ? closedLine : color.new(baseColor, 80))
+    if this.isClosed
+        box.set_border_style(this.visual, line.style_dotted)
+
+    // --- Corps (bodyTop–bodyBottom) : plus opaque + label ---
+    if na(this.bodyBox)
+        this.bodyBox := box.new(
+             left         = this.startTime,
+             top          = this.bodyTop,
+             right        = rightTime,
+             bottom       = this.bodyBottom,
+             xloc         = xloc.bar_time,
+             border_color = borderCol,
+             bgcolor      = bodyColor,
+             text         = lbl,
+             text_size    = size.tiny,
+             text_color   = borderCol,
+             text_halign  = text.align_right,
+             text_valign  = text.align_center)
+    box.set_right(this.bodyBox, rightTime)
+    box.set_bgcolor(this.bodyBox,      this.isClosed ? closedBg   : bodyColor)
+    box.set_border_color(this.bodyBox, this.isClosed ? closedLine : borderCol)
+    box.set_text(this.bodyBox,         lbl)
+    box.set_text_color(this.bodyBox,   this.isClosed ? closedLine : borderCol)
+    box.set_text_formatting(this.bodyBox, text.format_bold)
+    if this.isClosed
+        box.set_border_style(this.bodyBox, line.style_dotted)
+
+    // --- Ligne médiane (déléguée à ict_utils) ---
+    this.middleLine := icu.updateMidLine(
+         this.middleLine,
+         this.startTime,
+         this.middle,
+         rightTime,
+         this.isClosed)
+
+    // --- Ligne du retest le plus profond (déléguée à ict_utils) ---
+    this.retestLine := icu.updateRetestLine(
+         this.retestLine,
+         this.startTime,
+         this.deepestRetest,
+         rightTime,
+         this.isClosed)

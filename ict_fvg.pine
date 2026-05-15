@@ -1,0 +1,321 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © jeremie_marvillier
+//@version=6
+// @description Librairie ICT — détection, suivi et visualisation des Fair Value Gaps (FVG)
+library("ict_fvg")
+import jeremie_marvillier/ict_utils/1 as icu
+
+// ============================================================================
+//  TYPE
+// ============================================================================
+
+// @type Représente une Fair Value Gap (FVG)
+// @field top           Borne haute du gap
+// @field bottom        Borne basse du gap
+// @field middle        Milieu du gap (équilibre)
+// @field amplitude     Hauteur du gap en points de prix (top - bottom)
+// @field amplitudePct  Hauteur du gap en % du prix (référence : bottom)
+// @field isBull        Nature D'ORIGINE du FVG (immuable) : true = haussier, false = baissier
+// @field isVector      true si la bougie de déplacement a un volume élevé (FVG vectoriel)
+// @field isBisi        true si FVG haussier dont les 3 bougies du motif sont haussières
+// @field isSibi        true si FVG baissier dont les 3 bougies du motif sont baissières
+// @field isInverted    true si le FVG a été invalidé par clôture et a changé de polarité (IFVG)
+// @field isClosed      true si le gap a été entièrement comblé (mitigation classique)
+// @field deepestRetest Prix du retest le plus profond dans le référentiel courant
+//                      (remis à na lors de l'inversion : le sens du retest change)
+// @field startTime     Timestamp de la bougie d'origine du FVG
+// @field invertedTime  Timestamp de la bougie où l'inversion a eu lieu
+// @field closedTime    Timestamp où le FVG a été mitigé
+// @field vectorTime    Timestamp de la bougie de déplacement (bougie du milieu du motif)
+// @field visual        Référence au box du gap
+// @field middleLine    Ligne du milieu du gap
+// @field retestLine    Ligne du retest le plus profond
+export type FVG
+    float top
+    float bottom
+    float middle
+    float amplitude     = na
+    float amplitudePct  = na
+    bool  isBull
+    bool  isVector      = false
+    bool  isBisi        = false
+    bool  isSibi        = false
+    bool  isInverted    = false
+    bool  isClosed      = false
+    float deepestRetest = na
+    int   startTime     = na
+    int   invertedTime  = na
+    int   closedTime    = na
+    int   vectorTime    = na
+    box   visual        = na
+    line  middleLine    = na
+    line  retestLine    = na
+
+// ============================================================================
+//  HELPERS
+// ============================================================================
+
+// @function Direction EFFECTIVE du FVG : tient compte de l'inversion.
+//           Un FVG baissier inversé agit comme une zone haussière, et vice-versa.
+// @param this L'objet FVG
+// @returns true si le FVG agit actuellement comme une zone haussière
+export method effectiveBull(FVG this) =>
+    this.isInverted ? not this.isBull : this.isBull
+
+// ============================================================================
+//  DÉTECTION
+// ============================================================================
+
+// @function Détecte un FVG sur les 3 dernières bougies et le qualifie :
+//           vectoriel (volume élevé sur la bougie de déplacement) et
+//           BISI/SIBI (les 3 bougies du motif vont toutes dans le même sens).
+//           Calcule aussi l'amplitude du gap (points et % du prix).
+//           Utilise ta.sma en interne → doit être appelée à chaque bougie.
+// @param candlesOpens   Série des ouvertures
+// @param candlesHighs   Série des plus hauts
+// @param candlesLows    Série des plus bas
+// @param candlesCloses  Série des clôtures
+// @param candlesVolumes Série des volumes
+// @param volumeMult     Multiplicateur du volume moyen au-delà duquel le FVG est vectoriel (défaut 1.5)
+// @param volumeLen      Période de la moyenne de volume (défaut 20)
+// @returns FVG ou na si aucun gap détecté
+export GetFVG(
+     series float candlesOpens,
+     series float candlesHighs,
+     series float candlesLows,
+     series float candlesCloses,
+     series float candlesVolumes,
+     simple float volumeMult = 1.5,
+     simple int   volumeLen  = 20) =>
+    FVG result = na
+    float avgVolume = ta.sma(candlesVolumes, volumeLen)
+
+    float firstHigh = candlesHighs[2]
+    float firstLow  = candlesLows[2]
+    float lastHigh  = candlesHighs[0]
+    float lastLow   = candlesLows[0]
+
+    // La bougie de déplacement est celle du milieu du motif (offset 1)
+    bool isVector = candlesVolumes[1] > volumeMult * avgVolume
+
+    // Sens de chacune des 3 bougies du motif
+    bool c0Bull = candlesCloses[0] > candlesOpens[0]
+    bool c1Bull = candlesCloses[1] > candlesOpens[1]
+    bool c2Bull = candlesCloses[2] > candlesOpens[2]
+    bool c0Bear = candlesCloses[0] < candlesOpens[0]
+    bool c1Bear = candlesCloses[1] < candlesOpens[1]
+    bool c2Bear = candlesCloses[2] < candlesOpens[2]
+
+    if firstHigh < lastLow
+        // FVG haussier — BISI si les 3 bougies sont haussières
+        float t      = lastLow
+        float b      = firstHigh
+        float amp    = t - b
+        float ampPct = b != 0 ? amp / b * 100 : na
+        bool  isBisi = c0Bull and c1Bull and c2Bull
+        result := FVG.new(
+             top          = t,
+             bottom       = b,
+             middle       = (t + b) / 2,
+             amplitude    = amp,
+             amplitudePct = ampPct,
+             isBull       = true,
+             isVector     = isVector,
+             isBisi       = isBisi,
+             startTime    = time[2],
+             vectorTime   = time[1])
+    else if firstLow > lastHigh
+        // FVG baissier — SIBI si les 3 bougies sont baissières
+        float t      = firstLow
+        float b      = lastHigh
+        float amp    = t - b
+        float ampPct = b != 0 ? amp / b * 100 : na
+        bool  isSibi = c0Bear and c1Bear and c2Bear
+        result := FVG.new(
+             top          = t,
+             bottom       = b,
+             middle       = (t + b) / 2,
+             amplitude    = amp,
+             amplitudePct = ampPct,
+             isBull       = false,
+             isVector     = isVector,
+             isSibi       = isSibi,
+             startTime    = time[2],
+             vectorTime   = time[1])
+    result
+
+// ============================================================================
+//  MISE À JOUR
+// ============================================================================
+
+// @function Met à jour l'état du FVG : inversion (IFVG), mitigation et retest
+//           le plus profond. Cycle de vie : actif → inversé → mitigé.
+//           - Avant inversion : une clôture complète au-delà de la borne opposée
+//             au sens du FVG provoque l'inversion (deepestRetest remis à na).
+//           - Après inversion : plus de ré-inversion possible, seule la
+//             mitigation classique dans le NOUVEAU sens peut clôturer le FVG.
+//           - La mitigation est évaluée par icu.checkMitigation() (mèche).
+// @param this         L'objet FVG
+// @param currentHigh  Plus haut de la bougie courante
+// @param currentLow   Plus bas de la bougie courante
+// @param currentClose Clôture de la bougie courante (nécessaire pour l'inversion)
+export method update(FVG this, float currentHigh, float currentLow, float currentClose) =>
+    if not this.isClosed
+        // --- Phase 1 : tentative d'inversion (uniquement si pas encore inversé) ---
+        if not this.isInverted
+            if this.isBull and currentClose < this.bottom
+                // FVG haussier invalidé par une clôture sous la borne basse
+                this.isInverted    := true
+                this.invertedTime  := time
+                this.deepestRetest := na
+            else if not this.isBull and currentClose > this.top
+                // FVG baissier invalidé par une clôture au-dessus de la borne haute
+                this.isInverted    := true
+                this.invertedTime  := time
+                this.deepestRetest := na
+
+        // --- Phase 2 : retest + mitigation dans le référentiel EFFECTIF ---
+        // (vaut aussi bien pour un FVG normal que pour un IFVG)
+        bool effBull = this.effectiveBull()
+        [mitigated, newDeepest] = icu.checkMitigation(
+             effBull,
+             this.top,
+             this.bottom,
+             currentHigh,
+             currentLow,
+             this.deepestRetest)
+        if mitigated
+            this.isClosed      := true
+            this.closedTime    := time
+        this.deepestRetest := newDeepest
+
+// @function Supprime tous les éléments graphiques d'un FVG
+// @param this L'objet FVG
+export method clear(FVG this) =>
+    if not na(this.visual)
+        box.delete(this.visual)
+    if not na(this.middleLine)
+        line.delete(this.middleLine)
+    if not na(this.retestLine)
+        line.delete(this.retestLine)
+
+// ============================================================================
+//  ORCHESTRATION
+// ============================================================================
+
+// @function Détecte, maintient (FIFO) et met à jour un tableau de FVG.
+//           L'état (tableau) doit être déclaré côté appelant avec `var`.
+// @param fvgs           Tableau de FVG à maintenir
+// @param candlesOpens   Série des ouvertures
+// @param candlesHighs   Série des plus hauts
+// @param candlesLows    Série des plus bas
+// @param candlesCloses  Série des clôtures
+// @param candlesVolumes Série des volumes
+// @param limit          Nombre max de FVG à conserver (FIFO : le plus ancien est supprimé)
+// @param volumeMult     Multiplicateur de volume pour la détection vectorielle (défaut 1.5)
+// @param volumeLen      Période de la moyenne de volume (défaut 20)
+// @returns Le FVG nouvellement créé sur cette bougie, ou na s'il n'y en a pas
+export process(
+     array<FVG>   fvgs,
+     series float candlesOpens,
+     series float candlesHighs,
+     series float candlesLows,
+     series float candlesCloses,
+     series float candlesVolumes,
+     simple int   limit      = 20,
+     simple float volumeMult = 1.5,
+     simple int   volumeLen  = 20) =>
+    // 1. Détection
+    FVG newFvg = GetFVG(
+         candlesOpens,
+         candlesHighs,
+         candlesLows,
+         candlesCloses,
+         candlesVolumes,
+         volumeMult,
+         volumeLen)
+    if not na(newFvg)
+        array.push(fvgs, newFvg)
+        if array.size(fvgs) > limit
+            FVG removed = array.shift(fvgs)
+            removed.clear()
+
+    // 2. Update de tous les FVG actifs
+    for f in fvgs
+        f.update(candlesHighs[0], candlesLows[0], candlesCloses[0])
+
+    newFvg
+
+// ============================================================================
+//  RENDU
+// ============================================================================
+
+// @function Dessine ou met à jour la représentation graphique du FVG.
+//           La couleur et la légende suivent la direction EFFECTIVE
+//           (un IFVG ex-baissier devient vert, légende préfixée "I").
+//           Ne colore PAS les bougies vectorielles : barcolor() n'est
+//           appelable que dans le scope global d'un script.
+//           Les lignes médiane et de retest sont gérées via icu.updateMidLine()
+//           et icu.updateRetestLine().
+// @param this L'objet FVG
+export method draw(FVG this) =>
+    bool effBull = this.effectiveBull()
+
+    // Couleurs propres au FVG (vert/rouge selon direction effective)
+    color baseColor  = effBull ? color.green : color.red
+    color bgColor    = color.new(baseColor, 80)
+    color borderCol  = color.new(baseColor, 40)
+
+    // Couleurs partagées via ict_utils
+    color closedBg   = icu.closedBgColor()
+    color closedLine = icu.closedLineColor()
+
+    int rightTime = this.isClosed ? this.closedTime : time
+
+    // Légende : base BISI/SIBI/FVG±, préfixe "v" si vectoriel, préfixe "I" si inversé
+    string baseLabel = this.isBisi ? "BISI" : this.isSibi ? "SIBI" : effBull ? "FVG+" : "FVG-"
+    string prefix    = (this.isInverted ? "I" : "") + (this.isVector ? "v" : "")
+    string label     = prefix + baseLabel
+
+    // --- Box principale ---
+    if na(this.visual)
+        this.visual := box.new(
+             left         = this.startTime,
+             top          = this.top,
+             right        = rightTime,
+             bottom       = this.bottom,
+             xloc         = xloc.bar_time,
+             border_color = borderCol,
+             bgcolor      = bgColor,
+             text         = label,
+             text_size    = size.tiny,
+             text_color   = borderCol,
+             text_halign  = text.align_right,
+             text_valign  = text.align_center)
+    box.set_right(this.visual, rightTime)
+    // La couleur peut changer en cours de vie (inversion) → on la réapplique
+    box.set_bgcolor(this.visual, bgColor)
+    box.set_border_color(this.visual, borderCol)
+    box.set_text(this.visual, label)
+    box.set_text_color(this.visual, borderCol)
+    box.set_text_formatting(this.visual, text.format_bold)
+    if this.isClosed
+        box.set_bgcolor(this.visual, closedBg)
+        box.set_border_color(this.visual, closedLine)
+        box.set_border_style(this.visual, line.style_dotted)
+
+    // --- Ligne médiane (déléguée à ict_utils) ---
+    this.middleLine := icu.updateMidLine(
+         this.middleLine,
+         this.startTime,
+         this.middle,
+         rightTime,
+         this.isClosed)
+
+    // --- Ligne du retest le plus profond (déléguée à ict_utils) ---
+    this.retestLine := icu.updateRetestLine(
+         this.retestLine,
+         this.startTime,
+         this.deepestRetest,
+         rightTime,
+         this.isClosed)

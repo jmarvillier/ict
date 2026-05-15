@@ -1,0 +1,147 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © jeremie_marvillier
+//@version=6
+// @description Librairie ICT — utilitaires partagés : palette visuelle, logique de mitigation,
+//              rendu des lignes médiane et de retest. Utilisée par ict_fvg et ict_ob.
+library("ict_utils")
+
+// ============================================================================
+//  PALETTE — COULEURS ÉTAT FERMÉ
+//  Identiques dans tous les outils ICT ; centralisées ici pour cohérence.
+// ============================================================================
+
+// @function Couleur de la ligne médiane d'une zone ICT (gris semi-transparent)
+// @returns color
+export midColor() =>
+    color.new(color.gray, 30)
+
+// @function Couleur de la ligne du retest le plus profond (orange semi-transparent)
+// @returns color
+export retestColor() =>
+    color.new(color.orange, 20)
+
+// @function Couleur de fond d'une zone entièrement mitigée (gris très transparent)
+// @returns color
+export closedBgColor() =>
+    color.new(color.gray, 92)
+
+// @function Couleur de bordure et de ligne d'une zone entièrement mitigée (gris moyen)
+// @returns color
+export closedLineColor() =>
+    color.new(color.gray, 70)
+
+// ============================================================================
+//  LOGIQUE DE MITIGATION (pure — sans effet de bord)
+// ============================================================================
+
+// @function Calcule le nouvel état de mitigation d'une zone (FVG, OB…).
+//           Logique pure : aucun effet de bord sur les champs de l'objet appelant.
+//           La mitigation est évaluée sur la mèche (currentLow / currentHigh),
+//           conformément à la doctrine ICT.
+// @param effBull        Direction effective de la zone (true = haussière)
+// @param top            Borne haute de la zone
+// @param bottom         Borne basse de la zone
+// @param currentHigh    Plus haut de la bougie courante
+// @param currentLow     Plus bas de la bougie courante
+// @param deepestRetest  Retest le plus profond connu (na si aucun retest encore)
+// @returns Tuple [isMitigated, newDeepestRetest]
+//   isMitigated      — true si la zone est entièrement comblée sur cette bougie
+//   newDeepestRetest — retest mis à jour (ou deepestRetest inchangé si pas de retest)
+export checkMitigation(
+     bool  effBull,
+     float top,
+     float bottom,
+     float currentHigh,
+     float currentLow,
+     float deepestRetest) =>
+    bool  isMitigated = false
+    float newDeepest  = deepestRetest
+    if effBull
+        if currentLow <= bottom
+            isMitigated := true
+            newDeepest  := bottom
+        else if currentLow < top
+            if na(deepestRetest) or currentLow < deepestRetest
+                newDeepest := currentLow
+    else
+        if currentHigh >= top
+            isMitigated := true
+            newDeepest  := top
+        else if currentHigh > bottom
+            if na(deepestRetest) or currentHigh > deepestRetest
+                newDeepest := currentHigh
+    [isMitigated, newDeepest]
+
+// ============================================================================
+//  RENDU — LIGNE MÉDIANE
+// ============================================================================
+
+// @function Crée (si absente) ou met à jour la ligne médiane d'une zone ICT.
+//           Doit être appelée à chaque bougie depuis la méthode draw() de l'objet.
+//           Retourne toujours la référence à la ligne pour la réassigner côté appelant.
+// @param ln         Référence courante à la ligne (na si pas encore créée)
+// @param startTime  Timestamp de début de la zone (xloc.bar_time)
+// @param mid        Niveau médian de la zone
+// @param rightTime  Timestamp de fin (time courant si ouverte, closedTime si fermée)
+// @param isClosed   true si la zone est mitigée — passe la ligne en gris fermé
+// @returns Référence à la ligne (créée ou existante)
+export updateMidLine(
+     line  ln,
+     int   startTime,
+     float mid,
+     int   rightTime,
+     bool  isClosed) =>
+    line result = ln
+    if na(result)
+        result := line.new(
+             x1    = startTime,
+             y1    = mid,
+             x2    = rightTime,
+             y2    = mid,
+             xloc  = xloc.bar_time,
+             color = color.new(color.gray, 30),
+             style = line.style_dashed,
+             width = 1)
+    line.set_x2(result, rightTime)
+    if isClosed
+        line.set_color(result, color.new(color.gray, 70))
+    result
+
+// ============================================================================
+//  RENDU — LIGNE DE RETEST
+// ============================================================================
+
+// @function Crée (si absente) ou met à jour la ligne du retest le plus profond.
+//           N'effectue aucune opération graphique si deepestRetest est na.
+//           Doit être appelée à chaque bougie depuis la méthode draw() de l'objet.
+//           Retourne toujours la référence pour la réassigner côté appelant.
+// @param ln             Référence courante à la ligne (na si pas encore créée)
+// @param startTime      Timestamp de début de la zone (xloc.bar_time)
+// @param deepestRetest  Prix du retest le plus profond (na = pas encore retesté)
+// @param rightTime      Timestamp de fin (time courant si ouverte, closedTime si fermée)
+// @param isClosed       true si la zone est mitigée — passe la ligne en gris fermé
+// @returns Référence à la ligne (créée, existante, ou na si deepestRetest est na)
+export updateRetestLine(
+     line  ln,
+     int   startTime,
+     float deepestRetest,
+     int   rightTime,
+     bool  isClosed) =>
+    line result = ln
+    if not na(deepestRetest)
+        if na(result)
+            result := line.new(
+                 x1    = startTime,
+                 y1    = deepestRetest,
+                 x2    = rightTime,
+                 y2    = deepestRetest,
+                 xloc  = xloc.bar_time,
+                 color = color.new(color.orange, 20),
+                 style = line.style_solid,
+                 width = 1)
+        line.set_y1(result, deepestRetest)
+        line.set_y2(result, deepestRetest)
+        line.set_x2(result, rightTime)
+        if isClosed
+            line.set_color(result, color.new(color.gray, 70))
+    result

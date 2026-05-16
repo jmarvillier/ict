@@ -1,0 +1,367 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © jeremie_marvillier
+//@version=6
+// @description Librairie ICT — détection et visualisation de la liquidité (BSL/SSL avec
+//              classification HRLR/LRLR) et du Dealing Range (Equilibrium, Premium/Discount).
+library("ict_liquidity")
+import jeremie_marvillier/ict_utils/1 as icu
+
+// ============================================================================
+//  TYPE — LIQUIDITY
+// ============================================================================
+
+// @type Représente un niveau de liquidité ICT (BSL ou SSL).
+// @field price       Niveau de prix de la liquidité
+// @field isBSL       true = Buy-Side Liquidity (résistance au-dessus du prix),
+//                    false = Sell-Side Liquidity (support en-dessous du prix)
+// @field isCluster   true = HRLR (cluster d'égaux ≥ 2 niveaux),
+//                    false = LRLR (niveau isolé)
+// @field touches     Nombre de niveaux égaux dans le cluster (1 = LRLR, 2+ = HRLR)
+// @field isSwept     true si le niveau a été pris par une mèche (sweep effectué)
+// @field startTime   Timestamp du pivot d'origine
+// @field sweptTime   Timestamp du sweep (na si non swept)
+// @field visual      Référence à la ligne représentant le niveau
+// @field labelObj    Référence au label de catégorisation
+export type Liquidity
+    float price
+    bool  isBSL
+    bool  isCluster   = false
+    int   touches     = 1
+    bool  isSwept     = false
+    int   startTime   = na
+    int   sweptTime   = na
+    line  visual      = na
+    label labelObj    = na
+
+// ============================================================================
+//  TYPE — DEALING RANGE
+// ============================================================================
+
+// @type Représente le Dealing Range et ses zones Premium / Discount / Equilibrium.
+//       Le DR est calculé sur un lookback glissant ; les bornes haut/bas et
+//       l'équilibre 50% sont mis à jour à chaque bougie via la méthode update().
+// @field high        Plus haut du Dealing Range
+// @field low         Plus bas du Dealing Range
+// @field equilibrium Niveau d'équilibre 50% ((high + low) / 2)
+// @field highTime    Timestamp de la bougie qui définit le plus haut
+// @field lowTime     Timestamp de la bougie qui définit le plus bas
+// @field premiumBox  Box graphique de la zone Premium (50%-100% : zone de vente)
+// @field discountBox Box graphique de la zone Discount (0%-50% : zone d'achat)
+// @field eqLine      Ligne d'équilibre 50%
+export type DealingRange
+    float high        = na
+    float low         = na
+    float equilibrium = na
+    int   highTime    = na
+    int   lowTime     = na
+    box   premiumBox  = na
+    box   discountBox = na
+    line  eqLine      = na
+
+// ============================================================================
+//  HELPERS INTERNES
+// ============================================================================
+
+// Vérifie si deux niveaux sont "égaux" dans la tolérance donnée (% du prix).
+// Référence : le second niveau (b). Utilisé pour la classification HRLR / LRLR.
+isEqualLevel(float a, float b, float tolerancePct) =>
+    b != 0.0 and math.abs(a - b) / b * 100.0 <= tolerancePct
+
+// ============================================================================
+//  NETTOYAGE
+// ============================================================================
+
+// @function Supprime les éléments graphiques d'un niveau de liquidité.
+// @param this L'objet Liquidity
+export method clear(Liquidity this) =>
+    if not na(this.visual)
+        line.delete(this.visual)
+    if not na(this.labelObj)
+        label.delete(this.labelObj)
+
+// @function Supprime les éléments graphiques du Dealing Range.
+// @param this L'objet DealingRange
+export method clear(DealingRange this) =>
+    if not na(this.premiumBox)
+        box.delete(this.premiumBox)
+    if not na(this.discountBox)
+        box.delete(this.discountBox)
+    if not na(this.eqLine)
+        line.delete(this.eqLine)
+
+// ============================================================================
+//  MISE À JOUR — STATUT SWEEP
+// ============================================================================
+
+// Met à jour le statut isSwept des liquidités selon la bougie courante.
+// La mitigation d'un niveau de liquidité est évaluée sur la MÈCHE
+// (conformément à la doctrine ICT : "tag the level").
+// Fonction interne appelée par process().
+updateSweeps(array<Liquidity> liqs, float currentHigh, float currentLow) =>
+    for liq in liqs
+        if not liq.isSwept
+            if liq.isBSL and currentHigh > liq.price
+                liq.isSwept   := true
+                liq.sweptTime := time
+            else if not liq.isBSL and currentLow < liq.price
+                liq.isSwept   := true
+                liq.sweptTime := time
+
+// ============================================================================
+//  ORCHESTRATION — LIQUIDITY
+// ============================================================================
+
+// @function Détecte de nouveaux pivots de liquidité (BSL via ta.pivothigh,
+//           SSL via ta.pivotlow), les classe HRLR (cluster d'égaux ≥ 2) ou LRLR
+//           (isolé), met à jour le statut sweep de toutes les liquidités existantes,
+//           et maintient le tableau avec éviction FIFO.
+//
+//           Lors de la détection d'un nouveau pivot, tous les pivots existants
+//           non-swept du même type dans la tolérance sont reclassés ensemble en HRLR
+//           (reclassification rétroactive).
+//
+//           Le pivot détecté à la bougie courante correspond en réalité au prix
+//           `pivotLen` bougies en arrière (délai de confirmation droite).
+// @param liqs              Tableau de Liquidity à maintenir (var côté appelant)
+// @param candlesHighs      Série des plus hauts (typiquement `high`)
+// @param candlesLows       Série des plus bas (typiquement `low`)
+// @param pivotLen          Lookback gauche ET droite pour ta.pivothigh/pivotlow (défaut 5)
+// @param limit             Nombre max de Liquidity à conserver — FIFO (défaut 30)
+// @param equalTolerancePct Tolérance pour la classification HRLR (% du prix, défaut 0.1)
+// @returns Le nouveau Liquidity créé sur cette bougie, ou na
+export process(
+     array<Liquidity> liqs,
+     series float candlesHighs,
+     series float candlesLows,
+     simple int   pivotLen          = 5,
+     simple int   limit             = 30,
+     simple float equalTolerancePct = 0.1) =>
+
+    Liquidity result = na
+
+    // 1. Mise à jour du statut sweep des liquidités existantes
+    updateSweeps(liqs, candlesHighs[0], candlesLows[0])
+
+    // 2. Détection d'un nouveau pivot haut → BSL
+    float ph = ta.pivothigh(candlesHighs, pivotLen, pivotLen)
+    if not na(ph)
+        int pivotTime = time[pivotLen]
+
+        // Trouver les BSL existants non-swept dans la tolérance
+        array<Liquidity> bullCluster = array.new<Liquidity>()
+        for liq in liqs
+            if liq.isBSL and not liq.isSwept and isEqualLevel(ph, liq.price, equalTolerancePct)
+                array.push(bullCluster, liq)
+
+        int  clusterSize = array.size(bullCluster) + 1
+        bool isCluster   = clusterSize >= 2
+
+        Liquidity newBSL = Liquidity.new(
+             price     = ph,
+             isBSL     = true,
+             isCluster = isCluster,
+             touches   = clusterSize,
+             startTime = pivotTime)
+        array.push(liqs, newBSL)
+        result := newBSL
+
+        // Reclassification rétroactive des membres existants du cluster
+        for liq in bullCluster
+            liq.touches   := clusterSize
+            liq.isCluster := isCluster
+
+    // 3. Détection d'un nouveau pivot bas → SSL
+    float pl = ta.pivotlow(candlesLows, pivotLen, pivotLen)
+    if not na(pl)
+        int pivotTime = time[pivotLen]
+
+        array<Liquidity> bearCluster = array.new<Liquidity>()
+        for liq in liqs
+            if not liq.isBSL and not liq.isSwept and isEqualLevel(pl, liq.price, equalTolerancePct)
+                array.push(bearCluster, liq)
+
+        int  clusterSize = array.size(bearCluster) + 1
+        bool isCluster   = clusterSize >= 2
+
+        Liquidity newSSL = Liquidity.new(
+             price     = pl,
+             isBSL     = false,
+             isCluster = isCluster,
+             touches   = clusterSize,
+             startTime = pivotTime)
+        array.push(liqs, newSSL)
+        if na(result)
+            result := newSSL
+
+        for liq in bearCluster
+            liq.touches   := clusterSize
+            liq.isCluster := isCluster
+
+    // 4. Éviction FIFO
+    while array.size(liqs) > limit
+        Liquidity removed = array.shift(liqs)
+        removed.clear()
+
+    result
+
+// ============================================================================
+//  MISE À JOUR — DEALING RANGE
+// ============================================================================
+
+// @function Met à jour les bornes du Dealing Range sur un lookback glissant.
+//           High = plus haut des `lookback` dernières bougies, Low = plus bas.
+//           Equilibrium = (high + low) / 2. À appeler à chaque bougie.
+// @param this           L'objet DealingRange
+// @param candlesHighs   Série des plus hauts (typiquement `high`)
+// @param candlesLows    Série des plus bas (typiquement `low`)
+// @param lookback       Nombre de bougies à considérer pour le range (défaut 50)
+export method update(
+     DealingRange this,
+     series float candlesHighs,
+     series float candlesLows,
+     simple int   lookback = 50) =>
+    float h    = ta.highest(candlesHighs, lookback)
+    float l    = ta.lowest(candlesLows,  lookback)
+    int   hOff = ta.highestbars(candlesHighs, lookback)
+    int   lOff = ta.lowestbars(candlesLows,  lookback)
+    this.high        := h
+    this.low         := l
+    this.equilibrium := (h + l) / 2.0
+    this.highTime    := time[-hOff]
+    this.lowTime     := time[-lOff]
+
+// ============================================================================
+//  RENDU — LIQUIDITY
+// ============================================================================
+
+// @function Dessine ou met à jour la représentation graphique d'un niveau de liquidité.
+//           - LRLR actif : ligne pointillée fine (rouge BSL, vert SSL)
+//           - HRLR actif : ligne pleine plus épaisse + suffixe ×N
+//           - Swept     : ligne grise pointillée + suffixe ✗
+//
+//           Le label est ancré au bord droit (bougie courante si actif, ou
+//           sweptTime si swept). La ligne est tracée du pivot d'origine au bord droit.
+// @param this L'objet Liquidity
+export method draw(Liquidity this) =>
+    color baseColor = this.isBSL ? color.red : color.green
+    color activeCol = color.new(baseColor, 20)
+    color sweptCol  = icu.closedLineColor()
+
+    color  lineColor = this.isSwept ? sweptCol : activeCol
+    int    lineWidth = this.isCluster and not this.isSwept ? 2 : 1
+    string lineSty   = this.isSwept ? line.style_dotted : (this.isCluster ? line.style_solid : line.style_dashed)
+
+    int rightTime = this.isSwept ? this.sweptTime : time
+
+    string base   = this.isBSL ? "BSL" : "SSL"
+    string prefix = this.isCluster ? "HRLR " : "LRLR "
+    string mark   = this.isSwept ? " ✗" : (this.isCluster ? " ×" + str.tostring(this.touches) : "")
+    string lbl    = prefix + base + mark
+
+    // --- Ligne ---
+    if na(this.visual)
+        this.visual := line.new(
+             x1    = this.startTime,
+             y1    = this.price,
+             x2    = rightTime,
+             y2    = this.price,
+             xloc  = xloc.bar_time,
+             color = lineColor,
+             style = lineSty,
+             width = lineWidth)
+    line.set_x2(this.visual,    rightTime)
+    line.set_color(this.visual, lineColor)
+    line.set_style(this.visual, lineSty)
+    line.set_width(this.visual, lineWidth)
+
+    // --- Label ---
+    color labelBg   = color.new(baseColor, this.isSwept ? 90 : 85)
+    color labelText = this.isSwept ? sweptCol : color.new(baseColor, 20)
+    if na(this.labelObj)
+        this.labelObj := label.new(
+             x         = rightTime,
+             y         = this.price,
+             text      = lbl,
+             xloc      = xloc.bar_time,
+             style     = label.style_label_left,
+             color     = labelBg,
+             textcolor = labelText,
+             size      = size.small)
+    label.set_x(this.labelObj,         rightTime)
+    label.set_y(this.labelObj,         this.price)
+    label.set_text(this.labelObj,      lbl)
+    label.set_color(this.labelObj,     labelBg)
+    label.set_textcolor(this.labelObj, labelText)
+
+// ============================================================================
+//  RENDU — DEALING RANGE
+// ============================================================================
+
+// @function Dessine ou met à jour le Dealing Range : zones Premium (haut) et
+//           Discount (bas) séparées par la ligne d'équilibre 50%.
+//           - Premium  : rouge transparent (zone de vente ICT)
+//           - Discount : vert transparent  (zone d'achat ICT)
+//           - EQ       : gris pointillé
+//
+//           Ancrage gauche = min(highTime, lowTime). Ancrage droit = bougie courante.
+// @param this L'objet DealingRange
+export method draw(DealingRange this) =>
+    if not na(this.high) and not na(this.low) and not na(this.equilibrium)
+        int leftTime  = math.min(this.highTime, this.lowTime)
+        int rightTime = time
+
+        // --- Zone Premium (équilibre → haut) ---
+        if na(this.premiumBox)
+            this.premiumBox := box.new(
+                 left         = leftTime,
+                 top          = this.high,
+                 right        = rightTime,
+                 bottom       = this.equilibrium,
+                 xloc         = xloc.bar_time,
+                 border_color = color.new(color.red, 80),
+                 bgcolor      = color.new(color.red, 92),
+                 text         = "Premium",
+                 text_size    = size.small,
+                 text_color   = color.new(color.red, 30),
+                 text_halign  = text.align_right,
+                 text_valign  = text.align_top)
+        box.set_left(this.premiumBox,   leftTime)
+        box.set_top(this.premiumBox,    this.high)
+        box.set_right(this.premiumBox,  rightTime)
+        box.set_bottom(this.premiumBox, this.equilibrium)
+
+        // --- Zone Discount (bas → équilibre) ---
+        if na(this.discountBox)
+            this.discountBox := box.new(
+                 left         = leftTime,
+                 top          = this.equilibrium,
+                 right        = rightTime,
+                 bottom       = this.low,
+                 xloc         = xloc.bar_time,
+                 border_color = color.new(color.green, 80),
+                 bgcolor      = color.new(color.green, 92),
+                 text         = "Discount",
+                 text_size    = size.small,
+                 text_color   = color.new(color.green, 30),
+                 text_halign  = text.align_right,
+                 text_valign  = text.align_bottom)
+        box.set_left(this.discountBox,   leftTime)
+        box.set_top(this.discountBox,    this.equilibrium)
+        box.set_right(this.discountBox,  rightTime)
+        box.set_bottom(this.discountBox, this.low)
+
+        // --- Ligne d'équilibre 50% ---
+        if na(this.eqLine)
+            this.eqLine := line.new(
+                 x1    = leftTime,
+                 y1    = this.equilibrium,
+                 x2    = rightTime,
+                 y2    = this.equilibrium,
+                 xloc  = xloc.bar_time,
+                 color = color.new(color.gray, 20),
+                 style = line.style_dashed,
+                 width = 1)
+        line.set_x1(this.eqLine, leftTime)
+        line.set_y1(this.eqLine, this.equilibrium)
+        line.set_x2(this.eqLine, rightTime)
+        line.set_y2(this.eqLine, this.equilibrium)
